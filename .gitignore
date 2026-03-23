@@ -1,0 +1,22 @@
+# Binaries
+loglink
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.log
+app.log
+db.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Go
+vendor/
+go.sum
