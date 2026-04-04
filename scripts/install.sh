@@ -1,44 +1,42 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="${REPO:-github.com/alehhu/log-link/cmd/loglink}"
-BIN_NAME="${BIN_NAME:-loglink}"
+# Configuration
+REPO_URL="https://github.com/alehhu/log-link.git"
+BIN_NAME="loglink"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+TMP_DIR="/tmp/loglink-build"
 
+# 1. Check for Go
 if ! command -v go >/dev/null 2>&1; then
   echo "Error: Go is required but not found in PATH." >&2
   echo "Install Go first: https://go.dev/doc/install" >&2
   exit 1
 fi
 
-GO_BIN="$(go env GOPATH)/bin"
-mkdir -p "$GO_BIN"
+# 2. Setup Directories
 mkdir -p "$INSTALL_DIR"
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
 
-# Go binary name based on the last part of REPO path
-REPO_BIN_NAME=$(basename "$REPO")
+# 3. Clone and Build
+echo "Cloning $REPO_URL..."
+git clone --depth 1 "$REPO_URL" "$TMP_DIR" > /dev/null 2>&1
 
-echo "Installing $REPO@$([ -n "${VERSION:-}" ] && echo "$VERSION" || echo "latest")..."
-if [ -n "${VERSION:-}" ]; then
-  GO111MODULE=on go install "$REPO@$VERSION"
-else
-  GO111MODULE=on go install "$REPO@latest"
-fi
+echo "Building $BIN_NAME..."
+cd "$TMP_DIR"
+go build -o "$BIN_NAME" ./cmd/loglink
 
-# Locate the installed binary
-if [ -x "$GO_BIN/$REPO_BIN_NAME" ]; then
-  ACTUAL_BIN="$GO_BIN/$REPO_BIN_NAME"
-elif [ -x "$GO_BIN/$BIN_NAME" ]; then
-  ACTUAL_BIN="$GO_BIN/$BIN_NAME"
-else
-  echo "Error: expected binary not found at $GO_BIN/$REPO_BIN_NAME" >&2
-  exit 1
-fi
-
-cp "$ACTUAL_BIN" "$INSTALL_DIR/$BIN_NAME"
+# 4. Install
+cp "$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 chmod 0755 "$INSTALL_DIR/$BIN_NAME"
 
+# 5. Cleanup
+rm -rf "$TMP_DIR"
+
 echo "Installed to $INSTALL_DIR/$BIN_NAME"
+
+# 6. Path Verification
 case ":$PATH:" in
   *":$INSTALL_DIR:"*)
     echo "Ready: run '$BIN_NAME --help'"
