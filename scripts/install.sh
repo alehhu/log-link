@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# Cache-buster: v1.0.1
 set -eu
 
 # Configuration
