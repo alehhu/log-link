@@ -29,8 +29,8 @@ LogLink maintains a map of these signatures. Each signature tracks:
 -   **Last Seen:** The timestamp of its most recent occurrence.
 -   **Sources:** A breakdown of which log sources reported this error.
 
-## The Details Sidebar
-When you open the details sidebar (press `d`), the **INCIDENTS (top)** section displays the top 5 most frequent error signatures. This helps you quickly identify:
+## The Persistent Leaderboard & Details Modal
+When Incident Mode is active, a **Persistent Leaderboard** appears at the bottom of the screen displaying the top 3 most frequent error signatures. Additionally, when you open the details modal (press `d`), the **INCIDENTS (top)** section displays the top 5 most frequent error signatures. This helps you quickly identify:
 -   Which errors are the most "noisy" or frequent.
 -   How many different services (sources) are reporting a specific error.
 

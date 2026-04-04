@@ -55,7 +55,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.Top, k.Bottom},
+		{k.Up, k.Down, k.PageUp, k.PageDown, k.Top, k.Bottom},
 		{k.Highlight, k.Focus, k.Bookmark, k.NextMark, k.PrevMark},
 		{k.Pulse, k.ScrubBack, k.ScrubFwd, k.Source, k.Sidebar, k.Follow, k.Quit},
 	}
@@ -64,7 +64,9 @@ func (k keyMap) FullHelp() [][]key.Binding {
 var keys = keyMap{
 	Up:        key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
 	Down:      key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-	Top:       key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "top")),
+	PageUp:    key.NewBinding(key.WithKeys("pgup", "ctrl+u", "u"), key.WithHelp("u/ctrl+u", "pg up")),
+	PageDown:  key.NewBinding(key.WithKeys("pgdown", "ctrl+d", "d"), key.WithHelp("d/ctrl+d", "pg down")),
+	Top:       key.NewBinding(key.WithKeys("g"), key.WithHelp("gg", "top")),
 	Bottom:    key.NewBinding(key.WithKeys("G"), key.WithHelp("G", "now")),
 	Follow:    key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "follow")),
 	Highlight: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "highlight")),
@@ -120,6 +122,7 @@ type model struct {
 	incidents       map[string]*Incident
 	startedAt       time.Time
 	help            help.Model
+	lastKey         string
 }
 
 func initialModel(incidentMode bool) model {
@@ -132,6 +135,7 @@ func initialModel(incidentMode bool) model {
 		incidents:    map[string]*Incident{},
 		startedAt:    time.Now(),
 		help:         help.New(),
+		lastKey:      "",
 	}
 }
 
@@ -204,9 +208,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.follow = true
 			}
-		case key.Matches(msg, keys.Top):
-			m.cursor = 0
+		case key.Matches(msg, keys.PageUp):
+			m.cursor -= m.viewportH / 2
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
 			m.follow = false
+		case key.Matches(msg, keys.PageDown):
+			m.cursor += m.viewportH / 2
+			if m.cursor >= len(currEntries) {
+				m.cursor = len(currEntries) - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+		case key.Matches(msg, keys.Top):
+			if m.lastKey == "g" {
+				m.cursor = 0
+				m.follow = false
+				m.lastKey = ""
+			} else {
+				m.lastKey = "g"
+				// Clear lastKey after a short delay if no second g is pressed
+				return m, tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+					return "clearLastKey"
+				})
+			}
 		case key.Matches(msg, keys.Bottom):
 			if len(currEntries) > 0 {
 				m.cursor = len(currEntries) - 1
@@ -302,6 +329,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewportH = msg.Height
 		m.viewportW = msg.Width
 		m.ready = true
+
+	case string:
+		if msg == "clearLastKey" {
+			m.lastKey = ""
+		}
 
 	case LogEntry:
 		idx := len(m.entries)
@@ -499,14 +531,20 @@ func (m model) View() string {
 
 	// Main Layout
 	mainView := m.renderLogs()
-	if m.sidebarOpen {
-		sidebar := m.renderSidebar()
-		mainView = lipgloss.JoinHorizontal(lipgloss.Top, mainView, sidebar)
-	}
 	s.WriteString(mainView)
+
+	// Persistent Incident Leaderboard (if active)
+	if m.incidentMode && len(m.incidents) > 0 {
+		s.WriteString("\n" + m.renderIncidentBar())
+	}
 
 	// Footer
 	s.WriteString("\n" + m.help.View(keys))
+
+	// Overlay Modal if open
+	if m.sidebarOpen {
+		return lipgloss.Place(m.viewportW, m.viewportH, lipgloss.Center, lipgloss.Center, m.renderModal())
+	}
 
 	return s.String()
 }
@@ -535,13 +573,12 @@ func (m model) renderLogs() string {
 	s.WriteString(header + stats + "\n\n")
 
 	width := m.viewportW
-	if m.sidebarOpen {
-		width = int(float64(m.viewportW) * 0.6)
-	}
-
 	height := m.viewportH - 6
 	if len(m.metrics) > 0 {
 		height -= 2
+	}
+	if m.incidentMode && len(m.incidents) > 0 {
+		height -= 1
 	}
 	if height <= 0 {
 		return ""
@@ -603,7 +640,22 @@ func (m model) renderLogs() string {
 	return s.String()
 }
 
-func (m model) renderSidebar() string {
+func (m model) renderIncidentBar() string {
+	top := m.topIncidents(3)
+	var items []string
+	for _, inc := range top {
+		items = append(items, fmt.Sprintf("🔥 %dx %s", inc.Count, truncate(inc.Signature, 30)))
+	}
+	barStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color("235")).
+		Foreground(lipgloss.Color("214")).
+		Italic(true).
+		Padding(0, 1).
+		Width(m.viewportW)
+	return barStyle.Render("TOP INCIDENTS: " + strings.Join(items, " | "))
+}
+
+func (m model) renderModal() string {
 	currEntries := m.currentEntries()
 	if len(currEntries) == 0 {
 		return ""
@@ -611,35 +663,37 @@ func (m model) renderSidebar() string {
 	entry := currEntries[m.cursor]
 
 	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Bold(true).Underline(true).Render("DETAILS") + "\n\n")
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213")).Underline(true).Render("LOG ENTRY DETAILS") + "\n\n")
 	b.WriteString(subtleStyle.Render("Source: ") + entry.Source + "\n")
-	b.WriteString(subtleStyle.Render("Time:   ") + entry.Timestamp.Format("2006-01-02 15:04:05") + "\n\n")
+	b.WriteString(subtleStyle.Render("Time:   ") + entry.Timestamp.Format("2006-01-02 15:04:05.000") + "\n\n")
 
 	if len(entry.Entities) > 0 {
-		b.WriteString(lipgloss.NewStyle().Bold(true).Render("ENTITIES:") + "\n")
+		b.WriteString(lipgloss.NewStyle().Bold(true).Render("ENTITIES DETECTED:") + "\n")
 		for _, e := range entry.Entities {
 			b.WriteString("• " + e + "\n")
 		}
 		b.WriteString("\n")
 	}
 
-	if m.incidentMode {
-		b.WriteString(lipgloss.NewStyle().Bold(true).Render("INCIDENTS (top):") + "\n")
-		top := m.topIncidents(5)
-		if len(top) == 0 {
-			b.WriteString(subtleStyle.Render("No incidents detected yet") + "\n\n")
-		} else {
-			for _, inc := range top {
-				b.WriteString(fmt.Sprintf("• %dx %s\n", inc.Count, truncate(inc.Signature, 50)))
-			}
-			b.WriteString("\n")
-		}
-	}
-
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render("RAW CONTENT:") + "\n")
-	b.WriteString(lipgloss.NewStyle().Width(int(float64(m.viewportW) * 0.3)).Render(entry.Content))
+	contentStyle := lipgloss.NewStyle().
+		Width(int(float64(m.viewportW)*0.7) - 4).
+		Foreground(lipgloss.Color("255"))
+	b.WriteString(contentStyle.Render(entry.Content))
 
-	return sidebarStyle.Width(int(float64(m.viewportW) * 0.35)).Height(m.viewportH - 6).Render(b.String())
+	b.WriteString("\n\n" + subtleStyle.Render("Press 'd' or 'Esc' to close this window"))
+
+	modalWidth := int(float64(m.viewportW) * 0.7)
+	modalHeight := int(float64(m.viewportH) * 0.6)
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("62")).
+		Padding(1).
+		Width(modalWidth).
+		Height(modalHeight).
+		Background(lipgloss.Color("234")).
+		Render(b.String())
 }
 
 var sparklineChars = []string{" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"}

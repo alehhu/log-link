@@ -32,7 +32,7 @@ LogLink automatically detects UUIDs, Request IDs, and IPs. Select one, and it **
 Overlay live system metrics (CPU, Mem, or custom API stats) as a sparkline. **Temporal Scrubbing** allows you to move the cursor through the logs and see exactly what the metrics were at that millisecond.
 
 ### 🚨 Automatic Incident Clustering
-Stop chasing individual error lines. LogLink clusters similar failure signatures into "Incidents," allowing you to see the **top recurring issues** at a glance in the sidebar.
+Stop chasing individual error lines. LogLink clusters similar failure signatures into "Incidents," allowing you to see the **top recurring issues** at a glance in the persistent leaderboard at the bottom of the screen.
 
 ---
 
@@ -66,11 +66,13 @@ loglink api.log db.log worker.log --pulse "curl -fsS http://localhost:8080/load"
 | Key | Action |
 | --- | --- |
 | `f` | **Toggle Follow** (auto-scroll) |
+| `gg` / `G` | Jump to **Top** / Jump to **Latest** |
+| `u` / `d` | **Page Up** / **Page Down** |
 | `Enter` | **Highlight** ID under cursor across all files |
 | `s` | **Focus** (filter) only on the ID under cursor |
 | `Tab` | **Pulse Focus** (start scrubbing through time) |
 | `h` / `l` | Move pulse cursor (and log view) back/forward |
-| `d` | Toggle **Details Sidebar** (Incidents & Raw JSON) |
+| `d` | Toggle **Details Modal** (Incidents & Raw JSON) |
 | `v` | Open `file:line` in your **$EDITOR** |
 | `?` | Show full interactive help |
 

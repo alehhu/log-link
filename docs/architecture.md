@@ -19,7 +19,7 @@ All log entries from all sources are funneled into a single Go channel. The engi
 The user interface is built with the **Bubble Tea** framework, which uses an Elm-like architecture (Model-Update-View):
 -   **Model:** Maintains the list of log entries, the current cursor position, filters, and active highlights.
 -   **Update:** Handles keyboard input (scrolling, highlighting, filtering) and incoming log entries from the background goroutines.
--   **View:** Renders the terminal UI using **Lip Gloss** for styling, including the log timeline, the sparkline pulse graph, and the detailed sidebar.
+-   **View:** Renders the terminal UI using **Lip Gloss** for styling, including the log timeline, the sparkline pulse graph, the incident leaderboard, and the detailed floating modal.
 
 ## Data Structures
 
