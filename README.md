@@ -8,12 +8,12 @@ LogLink is a high-performance, terminal-native log aggregator designed for the d
 
 ---
 
-## ⚡️ The 30-Second "Magic Moment"
+## ⚡️ 30-second Quickstart: Speedrun edition
 
 The best way to understand LogLink is to see it in action. No configuration required:
 
 ```bash
-# Install and run the interactive demo in one go
+# Install and run the interactive demo in one go (Linux/macOS)
 curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/main/scripts/install.sh | sh
 loglink --demo --incident-mode
 ```
