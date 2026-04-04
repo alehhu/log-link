@@ -14,7 +14,7 @@ The best way to understand LogLink is to see it in action. No configuration requ
 
 ```bash
 # Install and run the interactive demo in one go (Linux/macOS)
-curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/release/scripts/install.sh | sh
 loglink --demo --incident-mode
 ```
 *This launches a simulated environment with API, DB, and Worker logs, overlays live CPU/Memory metrics, and clusters recurring errors.*
@@ -80,7 +80,7 @@ loglink api.log db.log worker.log --pulse "curl -fsS http://localhost:8080/load"
 
 ### Quick Install (macOS/Linux)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/release/scripts/install.sh | sh
 ```
 
 ### From Source
@@ -88,6 +88,13 @@ curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/master/scripts/inst
 git clone https://github.com/alehhu/log-link
 cd log-link
 go build -o loglink ./cmd/loglink
+```
+
+---
+
+## 🗑 Uninstall
+```bash
+curl -fsSL https://raw.githubusercontent.com/alehhu/log-link/release/scripts/uninstall.sh | sh
 ```
 
 ---
