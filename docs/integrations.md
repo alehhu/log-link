@@ -1,72 +1,122 @@
 # Integrations
 
-LogLink is designed to be easily extensible. Instead of a complex plugin system, it leverages the shell's power to run external commands.
+LogLink is designed to be easily extensible. Instead of a complex plugin system, it leverages the shell's power to run arbitrary commands as log sources.
+
+---
+
+## Labeling Sources
+
+Any source — file or command — can be given a human-readable label using the `label=source` syntax. The label appears in the source column instead of a truncated path or command string.
+
+```bash
+# Files
+loglink api=/var/log/api.log db=/var/log/db.log
+
+# Commands
+loglink api="kubectl logs -f deploy/api" db="kubectl logs -f deploy/postgres"
+
+# Mix
+loglink api=/var/log/api.log worker="kubectl logs -f deploy/worker"
+```
+
+Labels must start with a letter and contain only `[a-zA-Z0-9_-]`. The `=` splits on the first occurrence, so `kubectl` selectors like `app=api` inside the command string are preserved correctly.
+
+---
 
 ## Built-in Integration Shortcuts
 
-These flags are simply convenient aliases for common shell commands.
+These flags are convenient aliases for common shell commands. They also set a sensible default label automatically.
 
 ### 🐳 Docker
-Flag: `--docker <container_name>`
-
-This runs:
 ```bash
-docker logs -f <container_name>
+loglink --docker <container_name>
+# Equivalent to: docker logs -f <container_name>
+# Label: container name
 ```
 
 ### ⛵ Kubernetes
-Flag: `--kube-selector <label_selector>`
-
-This runs:
 ```bash
-kubectl logs -f -l "<label_selector>" --all-containers=true --prefix=true
+loglink --kube-selector <label_selector>
+# Equivalent to: kubectl logs -f -l "<selector>" --all-containers=true --prefix=true
 ```
-It's specifically designed to aggregate logs from all pods matching the selector, showing each source with a clear prefix.
+Aggregates logs from all pods matching the selector. For multi-namespace or multi-context setups, pass the full `kubectl` command directly as a labeled source:
+```bash
+loglink api="kubectl logs -f -l app=api -n production --context prod-cluster --all-containers"
+```
 
 ### 📜 systemd / journald
-Flag: `--journal-unit <unit_name>`
-
-This runs:
 ```bash
-journalctl -f -u <unit_name> -o short-iso
+loglink --journal-unit <unit_name>
+# Equivalent to: journalctl -f -u <unit_name> -o short-iso
+# Label: unit name
 ```
-The `short-iso` format ensures consistent timestamp parsing.
 
 ### 🐙 GitHub Actions
-Flag: `--gha-run <run_id>`
-
-This runs:
 ```bash
-gh run view <run_id> --log
-```
-Useful for local triage of CI failures.
-
-## 📈 Custom Pulse Metrics
-
-The `--pulse` flag allows you to run any shell command that returns a numeric value once per second. This numeric value is then plotted as a sparkline overlaying your logs.
-
-### Examples:
-
-**CPU Usage (macOS):**
-```bash
-loglink ... --pulse "top -l 1 | grep 'CPU usage' | awk '{print \$3}' | sed 's/%//'"
+loglink --gha-run <run_id>
+# Equivalent to: gh run view <run_id> --log
 ```
 
-**Memory Usage (Linux):**
+---
+
+## Remote Hosts (SSH)
+
+Pass a shell command as a labeled source to tail files on remote machines. The shell handles the SSH transport; LogLink handles the aggregation:
+
 ```bash
+loglink \
+  prod1="ssh prod-1 'tail -f /var/log/api.log'" \
+  prod2="ssh prod-2 'tail -f /var/log/api.log'"
+```
+
+---
+
+## 📈 Pulse Metrics
+
+The `--pulse <cmd>` flag runs any shell command that prints a single number, once per `--pulse-interval` seconds (default: 2). The value is plotted as a live bar chart above the log view.
+
+```bash
+# Kubernetes pod CPU (millicores)
+loglink --kube-selector app=api \
+  --pulse "kubectl top pod -l app=api --no-headers | awk '{print \$3}' | tr -d 'm'"
+
+# Docker container memory %
+loglink --docker web \
+  --pulse "docker stats web --no-stream --format '{{.MemPerc}}' | tr -d '%'"
+
+# Custom API metric
+loglink ... --pulse "curl -fsS http://localhost:8080/metrics/queue-depth"
+
+# System memory (Linux)
 loglink ... --pulse "free -m | awk 'NR==2{print \$3}'"
 ```
 
-**Custom API Metric:**
-```bash
-loglink ... --pulse "curl -fsS http://localhost:8080/metrics/active-requests"
-```
+### Pulse flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--pulse <cmd>` | — | Shell command returning a numeric value |
+| `--pulse-interval <n>` | `2` | Seconds between samples. Lower = more detail, higher = better battery. |
+
+### In-app pulse controls
+
+| Key | Action |
+|---|---|
+| `Tab` | Enter/exit temporal scrubbing mode |
+| `h` / `l` | Move cursor backward / forward along the metric timeline |
+| `=` / `-` | Zoom out / in (show more / less history) |
+| `P` | Toggle fullscreen pulse chart with Y-axis and timestamps |
+
+---
 
 ## Adding Custom Integrations
 
-Since LogLink can take any command as a positional argument, you can build your own custom integrations directly in the shell:
+Any shell command whose stdout is a stream of log lines works as a source:
 
 ```bash
-loglink "ssh prod-1 'tail -f /var/log/app.log'" "ssh prod-2 'tail -f /var/log/app.log'"
+# Stream from S3-backed log archive
+loglink archive="aws s3 cp s3://my-logs/2026-05-01.log - | tail -f"
+
+# Forward from a remote Kubernetes cluster
+loglink remote="kubectl --context staging logs -f deploy/api"
 ```
-The command output will be streamed into the TUI just like a local file.
