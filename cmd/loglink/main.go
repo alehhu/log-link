@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,42 +23,176 @@ import (
 )
 
 var (
-	entityRegex   = regexp.MustCompile(`([0-9a-fA-F-]{8,}|req-[a-zA-Z0-9]+|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
-	tsRegex       = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2}|\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})`)
-	fileLineRegex = regexp.MustCompile(`([a-zA-Z0-9._/-]+\.[a-z]{1,4}):(\d+)`)
+	entityRegex      = regexp.MustCompile(`([0-9a-fA-F-]{8,}|req-[a-zA-Z0-9]+|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+	tsRegex          = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2}|\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})`)
+	fileLineRegex    = regexp.MustCompile(`([a-zA-Z0-9._/-]+\.[a-z]{1,4}):(\d+)`)
+	// labeledSourceRe matches "label=source" where label is a plain identifier.
+	// Splitting only on first = means kubectl selectors inside the source part are preserved.
+	labeledSourceRe  = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9_-]*)=(.+)$`)
 )
 
+// logSource pairs a human-readable label with the actual file path or shell command.
+type logSource struct {
+	label string // shown in source column; empty = derive from arg
+	arg   string // file path or shell command
+}
+
+// --- Session persistence --------------------------------------------------
+
+type sessionSource struct {
+	Label string `json:"label,omitempty"`
+	Arg   string `json:"arg"`
+}
+
+type historicIncident struct {
+	TotalCount   int       `json:"total_count"`
+	SessionCount int       `json:"session_count"`
+	FirstSeen    time.Time `json:"first_seen"`
+	LastSeen     time.Time `json:"last_seen"`
+}
+
+type storedSession struct {
+	Sources         []sessionSource              `json:"sources,omitempty"`
+	IncidentMode    bool                         `json:"incident_mode,omitempty"`
+	PulseCmd        string                       `json:"pulse_cmd,omitempty"`
+	PulseInterval   int                          `json:"pulse_interval,omitempty"`
+	Description     string                       `json:"description,omitempty"`
+	LastUsed        time.Time                    `json:"last_used,omitempty"`
+	IncidentHistory map[string]*historicIncident `json:"incident_history,omitempty"`
+}
+
+type sessionStore struct {
+	Sessions map[string]storedSession `json:"sessions"`
+}
+
+func sessionFilePath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		dir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(dir, "loglink", "sessions.json")
+}
+
+func loadSessionStore() sessionStore {
+	data, err := os.ReadFile(sessionFilePath())
+	if err != nil {
+		return sessionStore{Sessions: map[string]storedSession{}}
+	}
+	var store sessionStore
+	if err := json.Unmarshal(data, &store); err != nil {
+		return sessionStore{Sessions: map[string]storedSession{}}
+	}
+	if store.Sessions == nil {
+		store.Sessions = map[string]storedSession{}
+	}
+	return store
+}
+
+func saveSession(name string, sources []logSource, incidentMode bool, pulseCmd string, pulseInterval int, newDesc string, incidents map[string]*Incident) error {
+	store := loadSessionStore()
+
+	ss := make([]sessionSource, len(sources))
+	for i, src := range sources {
+		ss[i] = sessionSource{Label: src.label, Arg: src.arg}
+	}
+
+	// Preserve existing description unless caller provides a new one.
+	existing := store.Sessions[name]
+	desc := existing.Description
+	if newDesc != "" {
+		desc = newDesc
+	}
+
+	// Merge current-session incidents into the persistent history.
+	history := existing.IncidentHistory
+	if history == nil {
+		history = map[string]*historicIncident{}
+	}
+	for sig, inc := range incidents {
+		if hi, ok := history[sig]; ok {
+			hi.TotalCount += inc.Count
+			hi.SessionCount++
+			if inc.FirstSeen.Before(hi.FirstSeen) {
+				hi.FirstSeen = inc.FirstSeen
+			}
+			if inc.LastSeen.After(hi.LastSeen) {
+				hi.LastSeen = inc.LastSeen
+			}
+		} else {
+			history[sig] = &historicIncident{
+				TotalCount:   inc.Count,
+				SessionCount: 1,
+				FirstSeen:    inc.FirstSeen,
+				LastSeen:     inc.LastSeen,
+			}
+		}
+	}
+
+	store.Sessions[name] = storedSession{
+		Sources:         ss,
+		IncidentMode:    incidentMode,
+		PulseCmd:        pulseCmd,
+		PulseInterval:   pulseInterval,
+		Description:     desc,
+		LastUsed:        time.Now(),
+		IncidentHistory: history,
+	}
+
+	path := sessionFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// program is set in main() before p.Run() so that in-app source additions
+// can start goroutines that send messages back to the TUI.
+var program *tea.Program
+
 type keyMap struct {
-	Up        key.Binding
-	Down      key.Binding
-	PageUp    key.Binding
-	PageDown  key.Binding
-	Top       key.Binding
-	Bottom    key.Binding
-	Follow    key.Binding
-	Highlight key.Binding
-	Focus     key.Binding
-	Bookmark  key.Binding
-	NextMark  key.Binding
-	PrevMark  key.Binding
-	Source    key.Binding
-	Pulse     key.Binding
-	ScrubBack key.Binding
-	ScrubFwd  key.Binding
-	Sidebar   key.Binding
-	Help      key.Binding
-	Quit      key.Binding
+	Up         key.Binding
+	Down       key.Binding
+	PageUp     key.Binding
+	PageDown   key.Binding
+	Top        key.Binding
+	Bottom     key.Binding
+	Follow     key.Binding
+	Highlight  key.Binding
+	Focus      key.Binding
+	Bookmark   key.Binding
+	NextMark   key.Binding
+	PrevMark   key.Binding
+	Source     key.Binding
+	Pulse      key.Binding
+	ScrubBack  key.Binding
+	ScrubFwd   key.Binding
+	Sidebar    key.Binding
+	Search     key.Binding
+	SearchNext key.Binding
+	SearchPrev key.Binding
+	AddSource  key.Binding
+	ZoomOut     key.Binding
+	ZoomIn      key.Binding
+	PulseExpand key.Binding
+	Help        key.Binding
+	Quit        key.Binding
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Help, k.Sidebar, k.Follow, k.Quit}
+	return []key.Binding{k.Search, k.AddSource, k.Help, k.Sidebar, k.Follow, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.Top, k.Bottom},
 		{k.Highlight, k.Focus, k.Bookmark, k.NextMark, k.PrevMark},
-		{k.Pulse, k.ScrubBack, k.ScrubFwd, k.Source, k.Sidebar, k.Follow, k.Quit},
+		{k.Search, k.SearchNext, k.SearchPrev, k.AddSource},
+		{k.Pulse, k.ScrubBack, k.ScrubFwd, k.ZoomOut, k.ZoomIn, k.PulseExpand},
+		{k.Source, k.Sidebar, k.Follow, k.Quit},
 	}
 }
 
@@ -78,9 +213,16 @@ var keys = keyMap{
 	Pulse:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "pulse focus")),
 	ScrubBack: key.NewBinding(key.WithKeys("h", "left"), key.WithHelp("h/←", "scrub back")),
 	ScrubFwd:  key.NewBinding(key.WithKeys("l", "right"), key.WithHelp("l/→", "scrub fwd")),
-	Sidebar:   key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "details")),
-	Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
-	Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	Sidebar:    key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "details")),
+	Search:     key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+	SearchNext: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next match")),
+	SearchPrev: key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match")),
+	AddSource:  key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add source")),
+	ZoomOut:     key.NewBinding(key.WithKeys("=", "+"), key.WithHelp("=", "zoom out")),
+	ZoomIn:      key.NewBinding(key.WithKeys("-"), key.WithHelp("-", "zoom in")),
+	PulseExpand: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "pulse fullscreen")),
+	Help:        key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+	Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 }
 
 type MetricEntry struct {
@@ -91,6 +233,7 @@ type MetricEntry struct {
 type Incident struct {
 	Signature string
 	Count     int
+	FirstSeen time.Time
 	LastSeen  time.Time
 	Sources   map[string]int
 }
@@ -100,7 +243,20 @@ type LogEntry struct {
 	Source    string
 	Content   string
 	Entities  []string
+	Level     string // canonical lowercase level: "error","warn","debug","info","fatal","panic","critical","trace"
 }
+
+// logEntryBatch is a slice of LogEntry sent as a single message to cap render rate.
+type logEntryBatch []LogEntry
+
+const (
+	// batchCooldown is the window after the leading-edge send during which
+	// additional lines are accumulated before a second flush. 50 ms caps renders
+	// at ~20 fps regardless of log volume while remaining imperceptible to users.
+	batchCooldown = 50 * time.Millisecond
+	// scannerBufSize is 1 MB — prevents silent drops of long JSON log lines.
+	scannerBufSize = 1 << 20
+)
 
 type model struct {
 	entries         []LogEntry
@@ -123,19 +279,36 @@ type model struct {
 	startedAt       time.Time
 	help            help.Model
 	lastKey         string
+	searchMode      bool
+	searchQuery     string
+	searchRe        *regexp.Regexp
+	addSourceMode   bool
+	addSourceInput  string
+	activeSources    []logSource
+	sessionName      string
+	sessionDesc      string
+	incidentHistory  map[string]*historicIncident
+	pulseWindow      int  // data points shown in sparkline (0 = auto)
+	pulseIntervalSec int  // seconds between pulse samples; used for time labels
+	pulseFullscreen  bool // P key toggles fullscreen pulse chart
 }
 
-func initialModel(incidentMode bool) model {
+func initialModel(incidentMode bool, sessionName, sessionDesc string, sources []logSource, history map[string]*historicIncident, pulseIntervalSec int) model {
 	return model{
-		entries:      []LogEntry{},
-		cursor:       0,
-		follow:       true,
-		sidebarOpen:  false,
-		incidentMode: incidentMode,
-		incidents:    map[string]*Incident{},
-		startedAt:    time.Now(),
-		help:         help.New(),
-		lastKey:      "",
+		entries:          []LogEntry{},
+		cursor:           0,
+		follow:           true,
+		sidebarOpen:      false,
+		incidentMode:     incidentMode,
+		incidents:        map[string]*Incident{},
+		startedAt:        time.Now(),
+		help:             help.New(),
+		lastKey:          "",
+		sessionName:      sessionName,
+		sessionDesc:      sessionDesc,
+		activeSources:    append([]logSource(nil), sources...),
+		incidentHistory:  history,
+		pulseIntervalSec: pulseIntervalSec,
 	}
 }
 
@@ -163,6 +336,75 @@ func (m model) currentEntries() []LogEntry {
 	return res
 }
 
+func (m *model) updateSearchRe() {
+	if m.searchQuery == "" {
+		m.searchRe = nil
+		return
+	}
+	m.searchRe = regexp.MustCompile("(?i)" + regexp.QuoteMeta(m.searchQuery))
+}
+
+func (m *model) searchJump(forward bool) {
+	if m.searchRe == nil {
+		return
+	}
+	ce := m.currentEntries()
+	if len(ce) == 0 {
+		return
+	}
+	if forward {
+		for i := m.cursor + 1; i < len(ce); i++ {
+			if m.searchRe.MatchString(ce[i].Content) {
+				m.cursor = i
+				m.follow = false
+				return
+			}
+		}
+		for i := 0; i <= m.cursor; i++ {
+			if m.searchRe.MatchString(ce[i].Content) {
+				m.cursor = i
+				m.follow = false
+				return
+			}
+		}
+	} else {
+		for i := m.cursor - 1; i >= 0; i-- {
+			if m.searchRe.MatchString(ce[i].Content) {
+				m.cursor = i
+				m.follow = false
+				return
+			}
+		}
+		for i := len(ce) - 1; i >= m.cursor; i-- {
+			if m.searchRe.MatchString(ce[i].Content) {
+				m.cursor = i
+				m.follow = false
+				return
+			}
+		}
+	}
+}
+
+func applySearchHighlight(content string, re *regexp.Regexp, baseStyle lipgloss.Style) string {
+	indices := re.FindAllStringIndex(content, -1)
+	if len(indices) == 0 {
+		return baseStyle.Render(content)
+	}
+	var sb strings.Builder
+	last := 0
+	for _, idx := range indices {
+		if idx[0] > last {
+			sb.WriteString(baseStyle.Render(content[last:idx[0]]))
+		}
+		sb.WriteString(searchMatchStyle.Render(content[idx[0]:idx[1]]))
+		last = idx[1]
+	}
+	if last < len(content) {
+		sb.WriteString(baseStyle.Render(content[last:]))
+	}
+	return sb.String()
+}
+
 func (m model) Init() tea.Cmd {
 	return nil
 }
@@ -170,6 +412,65 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Add-source mode: capture all keystrokes as text input.
+		if m.addSourceMode {
+			switch msg.Type {
+			case tea.KeyCtrlC:
+				return m, tea.Quit
+			case tea.KeyEsc:
+				m.addSourceMode = false
+				m.addSourceInput = ""
+			case tea.KeyEnter:
+				input := strings.TrimSpace(m.addSourceInput)
+				if input != "" {
+					src := logSource{arg: input}
+					if mm := labeledSourceRe.FindStringSubmatch(input); mm != nil {
+						src.label = mm[1]
+						src.arg = mm[2]
+					}
+					m.activeSources = append(m.activeSources, src)
+					go startSource(program, src)
+				}
+				m.addSourceMode = false
+				m.addSourceInput = ""
+			case tea.KeyBackspace, tea.KeyCtrlH:
+				if len(m.addSourceInput) > 0 {
+					runes := []rune(m.addSourceInput)
+					m.addSourceInput = string(runes[:len(runes)-1])
+				}
+			case tea.KeyRunes:
+				m.addSourceInput += string(msg.Runes)
+			}
+			return m, nil
+		}
+
+		// Search mode: capture all keystrokes as text input.
+		if m.searchMode {
+			switch msg.Type {
+			case tea.KeyCtrlC:
+				return m, tea.Quit
+			case tea.KeyEsc:
+				m.searchMode = false
+				m.searchQuery = ""
+				m.searchRe = nil
+			case tea.KeyEnter:
+				m.searchMode = false
+				if m.searchRe != nil {
+					m.searchJump(true)
+				}
+			case tea.KeyBackspace, tea.KeyCtrlH:
+				if len(m.searchQuery) > 0 {
+					runes := []rune(m.searchQuery)
+					m.searchQuery = string(runes[:len(runes)-1])
+					m.updateSearchRe()
+				}
+			case tea.KeyRunes:
+				m.searchQuery += string(msg.Runes)
+				m.updateSearchRe()
+			}
+			return m, nil
+		}
+
 		if m.showHelp {
 			m.showHelp = false
 			return m, nil
@@ -317,11 +618,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor = len(currEntries) - 1
 				}
 			}
+		case key.Matches(msg, keys.PulseExpand):
+			if len(m.metrics) > 0 {
+				m.pulseFullscreen = !m.pulseFullscreen
+			}
+		case key.Matches(msg, keys.ZoomOut):
+			if len(m.metrics) > 0 {
+				step := m.viewportW - 20
+				if step < 10 {
+					step = 10
+				}
+				if m.pulseWindow == 0 {
+					m.pulseWindow = min(len(m.metrics), step)
+				}
+				m.pulseWindow += step
+				if m.pulseWindow > len(m.metrics) {
+					m.pulseWindow = len(m.metrics)
+				}
+			}
+		case key.Matches(msg, keys.ZoomIn):
+			if m.pulseWindow > 0 {
+				step := m.viewportW - 20
+				if step < 10 {
+					step = 10
+				}
+				m.pulseWindow -= step
+				if m.pulseWindow <= 0 {
+					m.pulseWindow = 0 // back to auto (fit width)
+				}
+			}
+		case key.Matches(msg, keys.AddSource):
+			m.addSourceMode = true
+			m.addSourceInput = ""
+		case key.Matches(msg, keys.Search):
+			m.searchMode = true
+			m.searchQuery = ""
+			m.searchRe = nil
+		case key.Matches(msg, keys.SearchNext):
+			m.searchJump(true)
+		case key.Matches(msg, keys.SearchPrev):
+			m.searchJump(false)
 		case msg.String() == "esc":
 			m.highlightID = ""
 			m.focusID = ""
 			m.pulseFocus = false
+			m.pulseFullscreen = false
 			m.showHelp = false
+			m.searchMode = false
+			m.searchQuery = ""
+			m.searchRe = nil
+			m.addSourceMode = false
+			m.addSourceInput = ""
 			m.updateFilteredEntries()
 		}
 
@@ -335,42 +682,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastKey = ""
 		}
 
+	case logEntryBatch:
+		for _, entry := range msg {
+			m.insertEntry(entry)
+		}
+		if m.follow {
+			if ce := m.currentEntries(); len(ce) > 0 {
+				m.cursor = len(ce) - 1
+			}
+		}
+		return m, nil
+
 	case LogEntry:
-		idx := len(m.entries)
-		for i := len(m.entries) - 1; i >= 0; i-- {
-			if m.entries[i].Timestamp.Before(msg.Timestamp) || m.entries[i].Timestamp.Equal(msg.Timestamp) {
-				idx = i + 1
-				break
+		m.insertEntry(msg)
+		if m.follow {
+			if ce := m.currentEntries(); len(ce) > 0 {
+				m.cursor = len(ce) - 1
 			}
-			if i == 0 {
-				idx = 0
-			}
-		}
-		for i := range m.bookmarks {
-			if m.bookmarks[i] >= idx {
-				m.bookmarks[i]++
-			}
-		}
-		if idx == len(m.entries) {
-			m.entries = append(m.entries, msg)
-		} else {
-			m.entries = append(m.entries, LogEntry{})
-			copy(m.entries[idx+1:], m.entries[idx:])
-			m.entries[idx] = msg
-		}
-		if m.incidentMode {
-			m.updateIncidents(msg)
-		}
-		m.updateFilteredEntries()
-		ce := m.currentEntries()
-		if m.follow && len(ce) > 0 {
-			m.cursor = len(ce) - 1
 		}
 		return m, nil
 
 	case MetricEntry:
 		m.metrics = append(m.metrics, msg)
-		if len(m.metrics) > 200 {
+		if len(m.metrics) > 2000 {
 			m.metrics = m.metrics[1:]
 			if m.pulseCursor > 0 {
 				m.pulseCursor--
@@ -393,6 +727,47 @@ func (m model) getGlobalIdx(viewIdx int) int {
 		return -1
 	}
 	return m.filteredEntries[viewIdx]
+}
+
+func (m *model) insertEntry(entry LogEntry) {
+	// Binary search: insert after all entries with timestamp <= entry.Timestamp (stable sort).
+	idx := sort.Search(len(m.entries), func(i int) bool {
+		return m.entries[i].Timestamp.After(entry.Timestamp)
+	})
+
+	// Adjust bookmarks.
+	for i := range m.bookmarks {
+		if m.bookmarks[i] >= idx {
+			m.bookmarks[i]++
+		}
+	}
+
+	// Incrementally maintain filteredEntries: shift existing indices and conditionally
+	// add the new entry. This replaces the O(n) full rebuild in the hot path.
+	if m.focusID != "" {
+		for i := range m.filteredEntries {
+			if m.filteredEntries[i] >= idx {
+				m.filteredEntries[i]++
+			}
+		}
+		if strings.Contains(entry.Content, m.focusID) {
+			pos := sort.SearchInts(m.filteredEntries, idx)
+			m.filteredEntries = append(m.filteredEntries, 0)
+			copy(m.filteredEntries[pos+1:], m.filteredEntries[pos:])
+			m.filteredEntries[pos] = idx
+		}
+	}
+
+	if idx == len(m.entries) {
+		m.entries = append(m.entries, entry)
+	} else {
+		m.entries = append(m.entries, LogEntry{})
+		copy(m.entries[idx+1:], m.entries[idx:])
+		m.entries[idx] = entry
+	}
+	if m.incidentMode {
+		m.updateIncidents(entry)
+	}
 }
 
 func (m *model) jumpToNearestBookmark(forward bool) {
@@ -428,8 +803,13 @@ func (m *model) jumpToNearestBookmark(forward bool) {
 }
 
 func (m *model) updateIncidents(entry LogEntry) {
-	lower := strings.ToLower(entry.Content)
-	if !(strings.Contains(lower, "error") || strings.Contains(lower, "panic") || strings.Contains(lower, "fatal") || strings.Contains(lower, "timeout")) {
+	isError := entry.Level == "error" || entry.Level == "fatal" || entry.Level == "panic" || entry.Level == "critical"
+	if !isError {
+		lower := strings.ToLower(entry.Content)
+		isError = strings.Contains(lower, "error") || strings.Contains(lower, "panic") ||
+			strings.Contains(lower, "fatal") || strings.Contains(lower, "timeout")
+	}
+	if !isError {
 		return
 	}
 	sig := incidentSignature(entry.Content)
@@ -438,7 +818,7 @@ func (m *model) updateIncidents(entry LogEntry) {
 	}
 	inc, ok := m.incidents[sig]
 	if !ok {
-		inc = &Incident{Signature: sig, Sources: map[string]int{}}
+		inc = &Incident{Signature: sig, Sources: map[string]int{}, FirstSeen: entry.Timestamp}
 		m.incidents[sig] = inc
 	}
 	inc.Count++
@@ -500,17 +880,45 @@ func (m *model) jumpToTime(t time.Time) {
 }
 
 var (
-	subtleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	sourceStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
-	contentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	highlightStyle = lipgloss.NewStyle().Background(lipgloss.Color("57")).Foreground(lipgloss.Color("255"))
-	selectedStyle  = lipgloss.NewStyle().Background(lipgloss.Color("236"))
-	focusStyle     = lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("0")).Bold(true)
-	sidebarStyle   = lipgloss.NewStyle().Padding(1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62"))
-	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
-	badgeOnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("42")).Bold(true).Padding(0, 1)
-	badgeOffStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("240")).Padding(0, 1)
+	subtleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	sourceStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
+	contentStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	highlightStyle    = lipgloss.NewStyle().Background(lipgloss.Color("57")).Foreground(lipgloss.Color("255"))
+	selectedStyle     = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	focusStyle        = lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("0")).Bold(true)
+	sidebarStyle      = lipgloss.NewStyle().Padding(1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62"))
+	titleStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("62")).Padding(0, 1)
+	badgeOnStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("42")).Bold(true).Padding(0, 1)
+	badgeOffStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("240")).Padding(0, 1)
+	levelErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	levelWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	levelDebugStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	searchMatchStyle  = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0")).Bold(true)
+	searchBarStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true)
+	addSourceBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 )
+
+// errorLevelRe matches [ERROR], ERROR:, level=error, "level":"error" and equivalents for fatal/panic/critical.
+var errorLevelRe = regexp.MustCompile(`(?i)(?:\[(?:error|fatal|panic|critical)\]|(?:error|fatal|panic|critical):|level[=:]["']?(?:error|fatal|panic|critical))`)
+
+// warnLevelRe matches [WARN], WARN:, level=warn, "level":"warning" etc.
+var warnLevelRe = regexp.MustCompile(`(?i)(?:\[warn(?:ing)?\]|warn(?:ing)?:|level[=:]["']?warn(?:ing)?)`)
+
+// debugLevelRe matches [DEBUG], DEBUG:, level=debug, level=trace etc.
+var debugLevelRe = regexp.MustCompile(`(?i)(?:\[(?:debug|trace)\]|(?:debug|trace):|level[=:]["']?(?:debug|trace))`)
+
+func detectLogLevel(content string) string {
+	if errorLevelRe.MatchString(content) {
+		return "error"
+	}
+	if warnLevelRe.MatchString(content) {
+		return "warn"
+	}
+	if debugLevelRe.MatchString(content) {
+		return "debug"
+	}
+	return "info"
+}
 
 func (m model) View() string {
 	if !m.ready {
@@ -521,12 +929,15 @@ func (m model) View() string {
 		return m.renderHelp()
 	}
 
+	if m.pulseFullscreen && len(m.metrics) > 0 {
+		return m.renderPulseFullscreen()
+	}
+
 	var s strings.Builder
 
-	// Pulse Graph
+	// Compact pulse chart (stats header + 3-row bars).
 	if len(m.metrics) > 0 {
-		s.WriteString(m.renderSparkline())
-		s.WriteString("\n")
+		s.WriteString(m.renderSparklineCompact())
 	}
 
 	// Main Layout
@@ -539,7 +950,13 @@ func (m model) View() string {
 	}
 
 	// Footer
-	s.WriteString("\n" + m.help.View(keys))
+	if m.addSourceMode {
+		s.WriteString("\n" + addSourceBarStyle.Render("+ add source (label=cmd or path): "+m.addSourceInput+"█"))
+	} else if m.searchMode {
+		s.WriteString("\n" + searchBarStyle.Render("/ "+m.searchQuery+"█"))
+	} else {
+		s.WriteString("\n" + m.help.View(keys))
+	}
 
 	// Overlay Modal if open
 	if m.sidebarOpen {
@@ -556,7 +973,14 @@ func (m model) renderHelp() string {
 
 func (m model) renderLogs() string {
 	var s strings.Builder
-	header := titleStyle.Render(" LOGLINK ")
+	sessionLabel := m.sessionName
+	if sessionLabel == "" {
+		sessionLabel = "default"
+	}
+	if m.sessionDesc != "" {
+		sessionLabel += ": " + m.sessionDesc
+	}
+	header := titleStyle.Render(" LOGLINK ") + subtleStyle.Render(" ["+sessionLabel+"] ")
 	currEntries := m.currentEntries()
 	followBadge := badgeOffStyle.Render("FOLLOW OFF")
 	if m.follow {
@@ -570,12 +994,15 @@ func (m model) renderLogs() string {
 	if m.focusID != "" {
 		stats += fmt.Sprintf(" | FOCUS: %s", focusStyle.Render(m.focusID))
 	}
+	if m.searchQuery != "" {
+		stats += fmt.Sprintf(" | SEARCH: %s", searchBarStyle.Render("/"+m.searchQuery))
+	}
 	s.WriteString(header + stats + "\n\n")
 
 	width := m.viewportW
 	height := m.viewportH - 6
 	if len(m.metrics) > 0 {
-		height -= 2
+		height -= compactPulseHeight + 1 // 3 chart rows + 1 stats header
 	}
 	if m.incidentMode && len(m.incidents) > 0 {
 		height -= 1
@@ -631,6 +1058,22 @@ func (m model) renderLogs() string {
 		content := entry.Content
 		if isHighlighted {
 			content = highlightStyle.Render(content)
+		} else {
+			lvl := entry.Level // always set at parse time by newLogEntry
+			base := contentStyle
+			switch lvl {
+			case "error", "fatal", "panic", "critical":
+				base = levelErrorStyle
+			case "warn", "warning":
+				base = levelWarnStyle
+			case "debug", "trace":
+				base = levelDebugStyle
+			}
+			if m.searchRe != nil {
+				content = applySearchHighlight(content, m.searchRe, base)
+			} else {
+				content = base.Render(content)
+			}
 		}
 
 		line := fmt.Sprintf("%s %s %s %s", bookmarkIcon, ts, src, content)
@@ -665,7 +1108,20 @@ func (m model) renderModal() string {
 	var b strings.Builder
 	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213")).Underline(true).Render("LOG ENTRY DETAILS") + "\n\n")
 	b.WriteString(subtleStyle.Render("Source: ") + entry.Source + "\n")
-	b.WriteString(subtleStyle.Render("Time:   ") + entry.Timestamp.Format("2006-01-02 15:04:05.000") + "\n\n")
+	b.WriteString(subtleStyle.Render("Time:   ") + entry.Timestamp.Format("2006-01-02 15:04:05.000") + "\n")
+	if entry.Level != "" {
+		lvlStyle := contentStyle
+		switch entry.Level {
+		case "error", "fatal", "panic", "critical":
+			lvlStyle = levelErrorStyle
+		case "warn", "warning":
+			lvlStyle = levelWarnStyle
+		case "debug", "trace":
+			lvlStyle = levelDebugStyle
+		}
+		b.WriteString(subtleStyle.Render("Level:  ") + lvlStyle.Render(strings.ToUpper(entry.Level)) + "\n")
+	}
+	b.WriteString("\n")
 
 	if len(entry.Entities) > 0 {
 		b.WriteString(lipgloss.NewStyle().Bold(true).Render("ENTITIES DETECTED:") + "\n")
@@ -675,7 +1131,37 @@ func (m model) renderModal() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("RAW CONTENT:") + "\n")
+	// Cross-session incident history
+	if len(m.incidentHistory) > 0 {
+		type histEntry struct {
+			sig string
+			hi  *historicIncident
+		}
+		hist := make([]histEntry, 0, len(m.incidentHistory))
+		for sig, hi := range m.incidentHistory {
+			hist = append(hist, histEntry{sig, hi})
+		}
+		sort.Slice(hist, func(i, j int) bool {
+			return hist[i].hi.TotalCount > hist[j].hi.TotalCount
+		})
+		if len(hist) > 5 {
+			hist = hist[:5]
+		}
+		b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208")).Render("INCIDENT HISTORY (all sessions):") + "\n")
+		for _, h := range hist {
+			age := time.Since(h.hi.LastSeen).Round(time.Minute)
+			b.WriteString(fmt.Sprintf("  %s  %dx across %d sessions  last: %s ago\n",
+				levelErrorStyle.Render("▸"),
+				h.hi.TotalCount,
+				h.hi.SessionCount,
+				age,
+			))
+			b.WriteString("    " + subtleStyle.Render(truncate(h.sig, 70)) + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render("CONTENT:") + "\n")
 	contentStyle := lipgloss.NewStyle().
 		Width(int(float64(m.viewportW)*0.7) - 4).
 		Foreground(lipgloss.Color("255"))
@@ -698,27 +1184,69 @@ func (m model) renderModal() string {
 
 var sparklineChars = []string{" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
 
-func (m model) renderSparkline() string {
+// barEighths[n] = block char that is n/8 full from the bottom (for multi-row bar charts).
+var barEighths = []string{" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
+
+// compactPulseHeight is the number of chart rows in the compact (non-fullscreen) sparkline.
+const compactPulseHeight = 3
+
+// downsampleMax compresses src to targetLen elements by taking the maximum
+// value in each bucket. Spikes are preserved rather than averaged away.
+func downsampleMax(src []MetricEntry, targetLen int) []MetricEntry {
+	if len(src) <= targetLen {
+		return src
+	}
+	out := make([]MetricEntry, targetLen)
+	bucketSize := float64(len(src)) / float64(targetLen)
+	for i := 0; i < targetLen; i++ {
+		start := int(float64(i) * bucketSize)
+		end := int(float64(i+1) * bucketSize)
+		if end > len(src) {
+			end = len(src)
+		}
+		best := src[start]
+		for j := start + 1; j < end; j++ {
+			if src[j].Value > best.Value {
+				best = src[j]
+			}
+		}
+		out[i] = best
+	}
+	return out
+}
+
+// renderSparklineCompact renders a stats header line + compactPulseHeight-row bar chart.
+func (m model) renderSparklineCompact() string {
 	if len(m.metrics) == 0 {
 		return ""
 	}
 
-	width := m.viewportW - 20
-	if width < 10 {
-		width = 10
-	}
-	data := m.metrics
-	if len(data) > width {
-		data = data[len(data)-width:]
-	}
-	if m.pulseCursor < 0 {
-		m.pulseCursor = 0
-	}
-	if m.pulseCursor >= len(m.metrics) {
-		m.pulseCursor = len(m.metrics) - 1
+	chartWidth := m.viewportW
+	if chartWidth < 10 {
+		chartWidth = 10
 	}
 
-	maxVal, minVal, curVal := 0.0, 999999.0, 0.0
+	windowSize := m.pulseWindow
+	if windowSize <= 0 || windowSize > len(m.metrics) {
+		windowSize = len(m.metrics)
+	}
+
+	rawWindow := m.metrics[len(m.metrics)-windowSize:]
+	downsampled := len(rawWindow) > chartWidth
+	data := rawWindow
+	if downsampled {
+		data = downsampleMax(rawWindow, chartWidth)
+	}
+
+	pulseCursor := m.pulseCursor
+	if pulseCursor < 0 {
+		pulseCursor = 0
+	}
+	if pulseCursor >= len(m.metrics) {
+		pulseCursor = len(m.metrics) - 1
+	}
+
+	maxVal, minVal, curVal, sum := 0.0, math.MaxFloat64, 0.0, 0.0
 	for _, mt := range data {
 		if mt.Value > maxVal {
 			maxVal = mt.Value
@@ -727,24 +1255,270 @@ func (m model) renderSparkline() string {
 			minVal = mt.Value
 		}
 		curVal = mt.Value
+		sum += mt.Value
+	}
+	if minVal == math.MaxFloat64 {
+		minVal = 0
+	}
+	avg := sum / float64(max(1, len(data)))
+
+	windowLabel := ""
+	if m.pulseIntervalSec > 0 {
+		secs := windowSize * m.pulseIntervalSec
+		if secs < 60 {
+			windowLabel = fmt.Sprintf(" [%ds]", secs)
+		} else {
+			windowLabel = fmt.Sprintf(" [%dm]", secs/60)
+		}
+	}
+
+	statsStr := fmt.Sprintf("Pulse  cur:%.2f  min:%.1f  max:%.1f  avg:%.1f%s  =/-:zoom  tab:scrub  P:expand",
+		curVal, minVal, maxVal, avg, windowLabel)
+	statsLine := subtleStyle.Render(statsStr)
+
+	barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	cursorStyle := lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("0"))
+
+	// Build compactPulseHeight chart rows simultaneously, column by column.
+	rowBuilders := make([]strings.Builder, compactPulseHeight)
+	for i, met := range data {
+		v := 0.5
+		if maxVal > minVal {
+			v = (met.Value - minVal) / (maxVal - minVal)
+		}
+		total := compactPulseHeight * 8
+		filled := int(math.Round(v * float64(total)))
+		if filled > total {
+			filled = total
+		}
+
+		isCursor := !downsampled && m.pulseFocus && i == pulseCursor-(len(m.metrics)-windowSize)
+
+		for row := 0; row < compactPulseHeight; row++ {
+			bottomOffset := (compactPulseHeight - 1 - row) * 8
+			var char string
+			switch {
+			case filled <= bottomOffset:
+				char = " "
+			case filled >= bottomOffset+8:
+				char = "█"
+			default:
+				char = barEighths[filled-bottomOffset]
+			}
+			if isCursor {
+				rowBuilders[row].WriteString(cursorStyle.Render(char))
+			} else {
+				rowBuilders[row].WriteString(barStyle.Render(char))
+			}
+		}
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("Pulse: %0.2f [min:%0.1f max:%0.1f] ", curVal, minVal, maxVal))
-	for i, met := range data {
-		charIdx := 0
-		if maxVal-minVal > 0 {
-			charIdx = int(((met.Value - minVal) / (maxVal - minVal)) * float64(len(sparklineChars)-1))
-		}
-		char := sparklineChars[charIdx]
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-		isCursor := (m.pulseFocus && i == m.pulseCursor-(len(m.metrics)-len(data)))
-		if isCursor {
-			style = style.Background(lipgloss.Color("212")).Foreground(lipgloss.Color("0"))
-		}
-		s.WriteString(style.Render(char))
+	s.WriteString(statsLine + "\n")
+	for row := 0; row < compactPulseHeight; row++ {
+		s.WriteString(rowBuilders[row].String() + "\n")
 	}
 	return s.String()
+}
+
+// renderPulseFullscreen renders a full-viewport pulse chart with Y-axis, gridlines,
+// X-axis timestamps, and a stats header. Toggled with P.
+func (m model) renderPulseFullscreen() string {
+	const yAxisWidth = 8 // " XXXX.X ┤" — 6-char value + space + box char
+	chartWidth := m.viewportW - yAxisWidth
+	chartHeight := m.viewportH - 7 // stats + blank + chart + x-sep + x-labels + blank + footer
+	if chartWidth < 5 {
+		chartWidth = 5
+	}
+	if chartHeight < 4 {
+		chartHeight = 4
+	}
+
+	windowSize := m.pulseWindow
+	if windowSize <= 0 || windowSize > len(m.metrics) {
+		windowSize = len(m.metrics)
+	}
+
+	rawWindow := m.metrics[len(m.metrics)-windowSize:]
+	downsampled := len(rawWindow) > chartWidth
+	data := rawWindow
+	if downsampled {
+		data = downsampleMax(rawWindow, chartWidth)
+	}
+
+	pulseCursor := m.pulseCursor
+	if pulseCursor < 0 {
+		pulseCursor = 0
+	}
+	if pulseCursor >= len(m.metrics) {
+		pulseCursor = len(m.metrics) - 1
+	}
+
+	maxVal, minVal, curVal, sum := 0.0, math.MaxFloat64, 0.0, 0.0
+	for _, mt := range data {
+		if mt.Value > maxVal {
+			maxVal = mt.Value
+		}
+		if mt.Value < minVal {
+			minVal = mt.Value
+		}
+		curVal = mt.Value
+		sum += mt.Value
+	}
+	if minVal == math.MaxFloat64 {
+		minVal = 0
+	}
+	avg := sum / float64(max(1, len(data)))
+
+	windowLabel := ""
+	if m.pulseIntervalSec > 0 {
+		secs := windowSize * m.pulseIntervalSec
+		if secs < 60 {
+			windowLabel = fmt.Sprintf("[%ds] ", secs)
+		} else {
+			windowLabel = fmt.Sprintf("[%dm] ", secs/60)
+		}
+	}
+
+	cursorInfo := ""
+	if m.pulseFocus && pulseCursor < len(m.metrics) {
+		cursorInfo = "  cursor:" + m.metrics[pulseCursor].Timestamp.Format("15:04:05")
+	}
+
+	statsLine := titleStyle.Render(" PULSE ") + "  " +
+		subtleStyle.Render(fmt.Sprintf("cur:%.2f  min:%.1f  max:%.1f  avg:%.1f  %s%s",
+			curVal, minVal, maxVal, avg, windowLabel, cursorInfo))
+
+	// Rows with Y-axis labels (top, 33%, 67%, bottom) and gridlines at 33%/67%.
+	label33row := chartHeight * 2 / 3
+	label67row := chartHeight / 3
+	labeledRows := map[int]float64{
+		0:              maxVal,
+		label67row:     minVal + (maxVal-minVal)*0.67,
+		label33row:     minVal + (maxVal-minVal)*0.33,
+		chartHeight - 1: minVal,
+	}
+	gridRows := map[int]bool{label33row: true, label67row: true}
+
+	// Precompute filled eighths and cursor flag per column.
+	type col struct {
+		filled   int
+		isCursor bool
+	}
+	cols := make([]col, len(data))
+	for i, mt := range data {
+		v := 0.5
+		if maxVal > minVal {
+			v = (mt.Value - minVal) / (maxVal - minVal)
+		}
+		total := chartHeight * 8
+		filled := int(math.Round(v * float64(total)))
+		if filled > total {
+			filled = total
+		}
+		cols[i] = col{
+			filled:   filled,
+			isCursor: !downsampled && m.pulseFocus && i == pulseCursor-(len(m.metrics)-windowSize),
+		}
+	}
+
+	barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	cursorStyle := lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("0"))
+	gridStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+
+	var sb strings.Builder
+	sb.WriteString(statsLine + "\n\n")
+
+	for row := 0; row < chartHeight; row++ {
+		isGrid := gridRows[row]
+
+		// Y-axis prefix.
+		if lv, ok := labeledRows[row]; ok {
+			if isGrid {
+				sb.WriteString(subtleStyle.Render(fmt.Sprintf("%6.1f ┼", lv)))
+			} else {
+				sb.WriteString(subtleStyle.Render(fmt.Sprintf("%6.1f ┤", lv)))
+			}
+		} else if isGrid {
+			sb.WriteString(subtleStyle.Render("       ┼"))
+		} else {
+			sb.WriteString(subtleStyle.Render("       │"))
+		}
+
+		// Chart area.
+		for ci := 0; ci < len(cols); ci++ {
+			cd := cols[ci]
+			bottomOffset := (chartHeight - 1 - row) * 8
+			var char string
+			switch {
+			case cd.filled <= bottomOffset:
+				if isGrid {
+					char = "·"
+				} else {
+					char = " "
+				}
+			case cd.filled >= bottomOffset+8:
+				char = "█"
+			default:
+				char = barEighths[cd.filled-bottomOffset]
+			}
+			switch {
+			case cd.isCursor:
+				sb.WriteString(cursorStyle.Render(char))
+			case isGrid && char == "·":
+				sb.WriteString(gridStyle.Render(char))
+			default:
+				sb.WriteString(barStyle.Render(char))
+			}
+		}
+		// Pad to full chart width.
+		for ci := len(cols); ci < chartWidth; ci++ {
+			if isGrid {
+				sb.WriteString(gridStyle.Render("·"))
+			} else {
+				sb.WriteString(" ")
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	// X-axis separator.
+	sb.WriteString(subtleStyle.Render("       └"+strings.Repeat("─", chartWidth)) + "\n")
+
+	// X-axis timestamp labels.
+	xLabels := make([]byte, yAxisWidth+chartWidth)
+	for i := range xLabels {
+		xLabels[i] = ' '
+	}
+	if len(data) > 1 {
+		numLabels := chartWidth / 12
+		if numLabels < 2 {
+			numLabels = 2
+		}
+		if numLabels > 7 {
+			numLabels = 7
+		}
+		for i := 0; i <= numLabels; i++ {
+			ci := i * (len(data) - 1) / numLabels
+			if ci >= len(data) {
+				ci = len(data) - 1
+			}
+			ts := data[ci].Timestamp.Format("15:04")
+			pos := yAxisWidth + ci - 2
+			if pos < yAxisWidth {
+				pos = yAxisWidth
+			}
+			for j := 0; j < len(ts) && pos+j < len(xLabels); j++ {
+				xLabels[pos+j] = ts[j]
+			}
+		}
+	}
+	sb.WriteString(subtleStyle.Render(string(xLabels)) + "\n\n")
+
+	// Footer.
+	sb.WriteString(subtleStyle.Render("P/Esc: exit   Tab: scrub   h/l: move cursor   =/-: zoom"))
+
+	return sb.String()
 }
 
 func hashString(s string) int {
@@ -767,7 +1541,7 @@ func truncate(s string, l int) string {
 
 type cliConfig struct {
 	pulseCmd      string
-	sources       []string
+	sources       []logSource
 	incidentMode  bool
 	exportPath    string
 	exportFormat  string
@@ -776,6 +1550,9 @@ type cliConfig struct {
 	kubeSelector  string
 	journalUnit   string
 	ghaRun        string
+	session       string
+	desc          string
+	pulseInterval int
 }
 
 func parseCLI(args []string) (cliConfig, error) {
@@ -828,8 +1605,35 @@ func parseCLI(args []string) (cliConfig, error) {
 			}
 			cfg.ghaRun = args[i+1]
 			i++
+		case "--session":
+			if i+1 >= len(args) {
+				return cfg, fmt.Errorf("missing value for --session")
+			}
+			cfg.session = args[i+1]
+			i++
+		case "--desc":
+			if i+1 >= len(args) {
+				return cfg, fmt.Errorf("missing value for --desc")
+			}
+			cfg.desc = args[i+1]
+			i++
+		case "--pulse-interval":
+			if i+1 >= len(args) {
+				return cfg, fmt.Errorf("missing value for --pulse-interval")
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n < 1 {
+				return cfg, fmt.Errorf("--pulse-interval must be a positive integer")
+			}
+			cfg.pulseInterval = n
+			i++
 		default:
-			cfg.sources = append(cfg.sources, args[i])
+			src := logSource{arg: args[i]}
+			if m := labeledSourceRe.FindStringSubmatch(args[i]); m != nil {
+				src.label = m[1]
+				src.arg = m[2]
+			}
+			cfg.sources = append(cfg.sources, src)
 		}
 	}
 	if cfg.exportPath != "" && cfg.exportFormat == "" {
@@ -839,52 +1643,111 @@ func parseCLI(args []string) (cliConfig, error) {
 		return cfg, fmt.Errorf("invalid --format %q (use json or txt)", cfg.exportFormat)
 	}
 	cfg.sources = append(cfg.sources, integrationSources(cfg)...)
-	if len(cfg.sources) == 0 && !cfg.demo {
-		return cfg, fmt.Errorf("no log sources provided")
-	}
 	return cfg, nil
 }
 
-func integrationSources(cfg cliConfig) []string {
-	sources := []string{}
+func integrationSources(cfg cliConfig) []logSource {
+	var sources []logSource
 	if cfg.dockerService != "" {
-		sources = append(sources, fmt.Sprintf("docker logs -f %s", cfg.dockerService))
+		sources = append(sources, logSource{
+			label: cfg.dockerService,
+			arg:   fmt.Sprintf("docker logs -f %s", cfg.dockerService),
+		})
 	}
 	if cfg.kubeSelector != "" {
-		sources = append(sources, fmt.Sprintf(`kubectl logs -f -l "%s" --all-containers=true --prefix=true`, cfg.kubeSelector))
+		sources = append(sources, logSource{
+			arg: fmt.Sprintf(`kubectl logs -f -l "%s" --all-containers=true --prefix=true`, cfg.kubeSelector),
+		})
 	}
 	if cfg.journalUnit != "" {
-		sources = append(sources, fmt.Sprintf("journalctl -f -u %s -o short-iso", cfg.journalUnit))
+		sources = append(sources, logSource{
+			label: cfg.journalUnit,
+			arg:   fmt.Sprintf("journalctl -f -u %s -o short-iso", cfg.journalUnit),
+		})
 	}
 	if cfg.ghaRun != "" {
-		sources = append(sources, fmt.Sprintf("gh run view %s --log", cfg.ghaRun))
+		sources = append(sources, logSource{
+			arg: fmt.Sprintf("gh run view %s --log", cfg.ghaRun),
+		})
 	}
 	return sources
 }
 
-func startSource(p *tea.Program, arg string) {
-	info, err := os.Stat(arg)
-	if err == nil && !info.IsDir() {
-		go func(filename string) {
-			t, _ := tail.TailFile(filename, tail.Config{Follow: true, ReOpen: true, Logger: tail.DiscardingLogger, MustExist: true})
-			for line := range t.Lines {
-				p.Send(LogEntry{Timestamp: parseTimestamp(line.Text), Source: filename, Content: line.Text, Entities: findEntities(line.Text)})
+// batchSource reads from lineCh and forwards to the TUI using a leading-edge
+// + cooldown strategy: the first line of any burst is sent immediately (0ms
+// latency), subsequent lines within the batchCooldown window are accumulated
+// and sent as a single logEntryBatch (capping renders at ~20 fps).
+func batchSource(p *tea.Program, source string, lineCh <-chan string) {
+	var batch logEntryBatch
+	var cooldownC <-chan time.Time
+	for {
+		select {
+		case txt, ok := <-lineCh:
+			if !ok {
+				if len(batch) > 0 {
+					p.Send(batch)
+				}
+				return
 			}
-		}(arg)
+			entry := newLogEntry(source, txt)
+			if cooldownC == nil {
+				// Leading edge: send this line immediately, start cooldown.
+				p.Send(logEntryBatch{entry})
+				cooldownC = time.After(batchCooldown)
+			} else {
+				batch = append(batch, entry)
+			}
+		case <-cooldownC:
+			if len(batch) > 0 {
+				p.Send(batch)
+				batch = nil
+			}
+			cooldownC = nil
+		}
+	}
+}
+
+func startSource(p *tea.Program, src logSource) {
+	info, err := os.Stat(src.arg)
+	if err == nil && !info.IsDir() {
+		label := src.label
+		if label == "" {
+			label = filepath.Base(src.arg)
+		}
+		go func(filename, source string) {
+			t, _ := tail.TailFile(filename, tail.Config{Follow: true, ReOpen: true, Logger: tail.DiscardingLogger, MustExist: true})
+			lineCh := make(chan string, 512)
+			go func() {
+				for line := range t.Lines {
+					lineCh <- line.Text
+				}
+				close(lineCh)
+			}()
+			batchSource(p, source, lineCh)
+		}(src.arg, label)
 		return
 	}
-	go func(cmdLine string) {
+	label := src.label
+	if label == "" {
+		label = src.arg
+	}
+	go func(cmdLine, source string) {
 		cmd := exec.Command("sh", "-c", cmdLine)
 		stdout, _ := cmd.StdoutPipe()
 		cmd.Stderr = cmd.Stdout
 		cmd.Start()
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			txt := scanner.Text()
-			p.Send(LogEntry{Timestamp: parseTimestamp(txt), Source: cmdLine, Content: txt, Entities: findEntities(txt)})
-		}
+		lineCh := make(chan string, 512)
+		go func() {
+			scanner := bufio.NewScanner(stdout)
+			scanner.Buffer(make([]byte, scannerBufSize), scannerBufSize)
+			for scanner.Scan() {
+				lineCh <- scanner.Text()
+			}
+			close(lineCh)
+		}()
+		batchSource(p, source, lineCh)
 		cmd.Wait()
-	}(arg)
+	}(src.arg, label)
 }
 
 func runInternalDemo(p *tea.Program) {
@@ -1020,10 +1883,7 @@ func writeExport(path, format string, m model) error {
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	showHelp := false
-	if len(os.Args) < 2 {
-		showHelp = true
-	}
-	for _, arg := range os.Args {
+	for _, arg := range os.Args[1:] {
 		if arg == "--help" || arg == "-h" {
 			showHelp = true
 			break
@@ -1039,13 +1899,18 @@ func main() {
 		fmt.Println("  loglink [source1] [source2] ... [flags]")
 
 		fmt.Println(lipgloss.NewStyle().Bold(true).Underline(true).Render("\nLOG SOURCES:"))
-		fmt.Println("  Sources can be file paths, shell commands, or integration shortcuts.")
-		fmt.Println("  - File path:       loglink /var/log/syslog")
-		fmt.Println("  - Shell command:   loglink \"ssh remote-host 'tail -f /app/api.log'\"")
+		fmt.Println("  Sources can be file paths or shell commands, optionally prefixed with a label.")
+		fmt.Println("  - File path:         loglink /var/log/syslog")
+		fmt.Println("  - Labeled file:      loglink api=/var/log/api.log")
+		fmt.Println("  - Shell command:     loglink \"ssh host 'tail -f /app/api.log'\"")
+		fmt.Println("  - Labeled command:   loglink api=\"kubectl logs -f deploy/api\"")
 
 		fmt.Println(lipgloss.NewStyle().Bold(true).Underline(true).Render("\nFLAGS:"))
-		fmt.Println("  --pulse, -p <cmd>        Execute <cmd> every second and plot numeric output as a sparkline.")
+		fmt.Println("  --pulse, -p <cmd>        Execute <cmd> periodically and plot numeric output as a sparkline.")
+		fmt.Println("  --pulse-interval <n>     Pulse polling interval in seconds (default: 2). Saves battery.")
 		fmt.Println("  --incident-mode          Cluster error patterns automatically and show in sidebar.")
+		fmt.Println("  --session <name>         Load/save a named source session (default: \"default\").")
+		fmt.Println("  --desc <text>            Set a human-readable description for the session.")
 		fmt.Println("  --export <path>          Save a session summary (incidents, counts) to <path> on exit.")
 		fmt.Println("  --format <json|txt>      Set export format (default: json).")
 		fmt.Println("  --demo                   Launch with built-in log simulator and dummy metrics.")
@@ -1057,8 +1922,10 @@ func main() {
 		fmt.Println("  --gha-run <id>           Shortcut for 'gh run view <id> --log'")
 
 		fmt.Println(lipgloss.NewStyle().Bold(true).Underline(true).Render("\nEXAMPLES:"))
-		fmt.Println("  # Monitor local and remote logs together")
-		fmt.Println("  loglink app.log \"ssh worker-1 'tail -f /var/log/worker.log'\"")
+		fmt.Println("  # Label sources for a readable source column")
+		fmt.Println("  loglink api=api.log worker=worker.log db=db.log")
+		fmt.Println("\n  # Mix labeled files and labeled commands")
+		fmt.Println("  loglink api=\"kubectl logs -f deploy/api\" db=\"kubectl logs -f deploy/postgres\"")
 		fmt.Println("\n  # Debug K8s pods with incident detection")
 		fmt.Println("  loglink --kube-selector app=api --incident-mode")
 		fmt.Println("\n  # Correlate Docker logs with container CPU usage")
@@ -1074,15 +1941,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(cfg.incidentMode), tea.WithAltScreen())
+	// Resolve session name (default: "default").
+	sessionName := cfg.session
+	if sessionName == "" {
+		sessionName = "default"
+	}
+
+	// Load the stored session — used for restoring sources, description, history.
+	store := loadSessionStore()
+	storedSess := store.Sessions[sessionName]
+	sessionDesc := storedSess.Description
+	incidentHistory := storedSess.IncidentHistory
+
+	// If no sources were given on the CLI, restore from the saved session.
+	if len(cfg.sources) == 0 && !cfg.demo {
+		for _, ss := range storedSess.Sources {
+			cfg.sources = append(cfg.sources, logSource{label: ss.Label, arg: ss.Arg})
+		}
+		if !cfg.incidentMode {
+			cfg.incidentMode = storedSess.IncidentMode
+		}
+		if cfg.pulseCmd == "" {
+			cfg.pulseCmd = storedSess.PulseCmd
+		}
+		if cfg.pulseInterval == 0 {
+			cfg.pulseInterval = storedSess.PulseInterval
+		}
+		if len(cfg.sources) == 0 {
+			fmt.Fprintf(os.Stderr, "Session %q has no sources. Provide sources on the command line or press 'a' inside the app.\n", sessionName)
+			fmt.Fprintf(os.Stderr, "Run 'loglink --help' for usage.\n")
+			os.Exit(1)
+		}
+	}
+
+	p := tea.NewProgram(initialModel(cfg.incidentMode, sessionName, sessionDesc, cfg.sources, incidentHistory, cfg.pulseInterval), tea.WithAltScreen())
+	program = p // must be set before goroutines call startSource
 
 	if cfg.demo {
 		runInternalDemo(p)
 	}
 
 	if cfg.pulseCmd != "" {
-		go func(cmdLine string) {
-			ticker := time.NewTicker(1 * time.Second)
+		if cfg.pulseInterval < 1 {
+			cfg.pulseInterval = 2
+		}
+		go func(cmdLine string, interval time.Duration) {
+			ticker := time.NewTicker(interval)
 			for range ticker.C {
 				cmd := exec.Command("sh", "-c", cmdLine)
 				out, err := cmd.Output()
@@ -1093,16 +1997,20 @@ func main() {
 					}
 				}
 			}
-		}(cfg.pulseCmd)
+		}(cfg.pulseCmd, time.Duration(cfg.pulseInterval)*time.Second)
 	}
 
-	for _, arg := range cfg.sources {
-		startSource(p, arg)
+	for _, src := range cfg.sources {
+		startSource(p, src)
 	}
 
 	finalModel, _ := p.Run()
-	if cfg.exportPath != "" {
-		if fm, ok := finalModel.(model); ok {
+	if fm, ok := finalModel.(model); ok {
+		// Save session — sources, incidents, pulse cmd, description.
+		if err := saveSession(sessionName, fm.activeSources, fm.incidentMode, cfg.pulseCmd, cfg.pulseInterval, cfg.desc, fm.incidents); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not save session: %v\n", err)
+		}
+		if cfg.exportPath != "" {
 			if err := writeExport(cfg.exportPath, cfg.exportFormat, fm); err != nil {
 				fmt.Fprintf(os.Stderr, "Export failed: %v\n", err)
 				os.Exit(1)
@@ -1114,6 +2022,196 @@ func main() {
 
 func findEntities(content string) []string {
 	return entityRegex.FindAllString(content, -1)
+}
+
+func normalizeLevel(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "error", "err":
+		return "error"
+	case "fatal":
+		return "fatal"
+	case "panic":
+		return "panic"
+	case "critical", "crit":
+		return "critical"
+	case "warn", "warning":
+		return "warn"
+	case "debug":
+		return "debug"
+	case "trace":
+		return "trace"
+	default:
+		return "info"
+	}
+}
+
+func formatJSONValue(v interface{}) string {
+	switch tv := v.(type) {
+	case string:
+		return tv
+	case float64:
+		if tv == float64(int64(tv)) {
+			return strconv.FormatInt(int64(tv), 10)
+		}
+		return strconv.FormatFloat(tv, 'f', -1, 64)
+	case bool:
+		if tv {
+			return "true"
+		}
+		return "false"
+	case nil:
+		return ""
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+}
+
+// tryParseJSON detects a JSON object anywhere in the line (handles kubectl --prefix=true prefixes),
+// extracts structured fields, and returns a human-readable display string + metadata.
+func tryParseJSON(content string) (msg, level string, ts time.Time, hasTS bool, entities []string, display string, ok bool) {
+	idx := strings.IndexByte(content, '{')
+	if idx == -1 {
+		return
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(content[idx:]), &raw); err != nil {
+		return
+	}
+
+	seen := make(map[string]bool)
+
+	// Message
+	for _, k := range []string{"msg", "message", "MESSAGE", "log", "body", "text"} {
+		if v, okv := raw[k]; okv {
+			msg = fmt.Sprintf("%v", v)
+			seen[k] = true
+			break
+		}
+	}
+
+	// Level
+	for _, k := range []string{"level", "Level", "LEVEL", "severity", "lvl"} {
+		if v, okv := raw[k]; okv {
+			level = normalizeLevel(fmt.Sprintf("%v", v))
+			seen[k] = true
+			break
+		}
+	}
+
+	// Timestamp
+	for _, k := range []string{"ts", "time", "timestamp", "TIME", "@timestamp"} {
+		if v, okv := raw[k]; okv {
+			seen[k] = true
+			switch tv := v.(type) {
+			case string:
+				for _, f := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
+					if t, err := time.Parse(f, tv); err == nil {
+						ts = t
+						hasTS = true
+						break
+					}
+				}
+			case float64:
+				ts = time.Unix(int64(tv), 0)
+				hasTS = true
+			}
+			break
+		}
+	}
+
+	// Error field
+	errMsg := ""
+	for _, k := range []string{"error", "err", "Error"} {
+		if v, okv := raw[k]; okv && v != nil {
+			s := fmt.Sprintf("%v", v)
+			if s != "" && s != "<nil>" {
+				errMsg = s
+				seen[k] = true
+			}
+			break
+		}
+	}
+
+	// Correlation/trace entities (extracted for causal linking)
+	for _, k := range []string{"trace_id", "traceID", "traceId", "traceid", "request_id", "requestId", "req_id", "span_id", "spanId", "spanID", "correlation_id"} {
+		if v, okv := raw[k]; okv {
+			val := fmt.Sprintf("%v", v)
+			if val != "" && val != "<nil>" {
+				entities = append(entities, val)
+				seen[k] = true
+			}
+		}
+	}
+
+	// Build display: msg  [err=...]  key=val key=val (remaining fields, sorted)
+	var sb strings.Builder
+	if msg != "" {
+		sb.WriteString(msg)
+	} else if idx > 0 {
+		// Preserve any non-JSON prefix (e.g. kubectl pod prefix)
+		sb.WriteString(strings.TrimSpace(content[:idx]))
+	}
+	if errMsg != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("  ")
+		}
+		sb.WriteString("err=" + errMsg)
+	}
+
+	remaining := make([]string, 0, len(raw))
+	for k := range raw {
+		if !seen[k] {
+			remaining = append(remaining, k)
+		}
+	}
+	sort.Strings(remaining)
+	for _, k := range remaining {
+		val := formatJSONValue(raw[k])
+		if val == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("  ")
+		}
+		sb.WriteString(k + "=" + val)
+	}
+
+	if sb.Len() == 0 {
+		return msg, level, ts, hasTS, entities, "", false
+	}
+	display = sb.String()
+	ok = true
+	return
+}
+
+func newLogEntry(source, text string) LogEntry {
+	ts := parseTimestamp(text)
+	entities := findEntities(text)
+	content := text
+	level := ""
+
+	if _, parsedLevel, parsedTS, hasTS, traceEntities, display, ok := tryParseJSON(text); ok {
+		content = display
+		level = parsedLevel
+		if hasTS {
+			ts = parsedTS
+		}
+		// Prepend parsed trace entities so they're first in the list (highest priority for Enter/s)
+		entities = append(traceEntities, entities...)
+	}
+	// Always resolve level at parse time so renderLogs never calls detectLogLevel per frame.
+	if level == "" {
+		level = detectLogLevel(content)
+	}
+
+	return LogEntry{
+		Timestamp: ts,
+		Source:    source,
+		Content:   content,
+		Entities:  entities,
+		Level:     level,
+	}
 }
 
 func parseTimestamp(content string) time.Time {
